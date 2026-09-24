@@ -1,0 +1,20 @@
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Generated bundles (keep fastbid.spec tracked)
+/build/
+/dist/
+
+# Temporary audit files
+/_audit_tests.log
+/_audit_probe.py

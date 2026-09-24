@@ -1,0 +1,17 @@
+# FastBid GosZakup — зависимости времени выполнения
+# Python 3.12+ (проверено на 3.13.9 / Windows и 3.12+ / macOS)
+#
+# Асинхронный HTTP-стек с HTTP/2 (h2) — нужен для мультиплексирования
+# предзагрузки документов и минимальной задержки submit.
+httpx[http2]>=0.28.1
+websockets>=13.0
+cryptography>=44.0
+customtkinter>=5.2.2
+darkdetect>=0.8.0
+tzdata>=2024.1; sys_platform == "win32"
+
+# --- Dev / test (опционально) ---
+pytest>=8.0
+
+# --- Сборка дистрибутивов (опционально) ---
+# pyinstaller>=6.10.0
