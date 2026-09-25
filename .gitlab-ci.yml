@@ -1,0 +1,19 @@
+# FastBid GosZakup — CI: линт + тесты (Linux-раннер GitLab).
+# UI-тесты без Tcl/Tk пропускаются автоматически (см. README §7).
+stages: [test]
+
+test:
+  stage: test
+  image: python:3.13
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  cache:
+    key: pip313
+    paths:
+      - .cache/pip
+  before_script:
+    - pip install -r requirements-dev.txt
+  script:
+    - python -m ruff check .
+    - python -m ruff format --check .
+    - python -m pytest tests/ -q
