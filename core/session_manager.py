@@ -30,7 +30,7 @@ from typing import Any
 import httpx
 
 from config.niche_blueprints import SignMode
-from config.settings import LIVE_AUTH_NOTICE, AppSettings
+from config.settings import LIVE_AUTH_NOTICE, OWS_TOKEN_NOTICE, AppSettings
 from core.ncalayer_client import (
     KeyInfo,
     NCALayerClient,
@@ -280,9 +280,27 @@ class SessionManager:
         return token, cookie_header
 
     def _require_auth_contract(self) -> None:
-        if not self.settings.uses_local_mock:
+        if not self.settings.cabinet_api_verified:
             self.clear_credentials()
             raise PortalError(LIVE_AUTH_NOTICE, code="LIVE_AUTH_UNVERIFIED")
+
+    # -- токен публичного реестра OWS ---------------------------------------- #
+    def ows_headers(self) -> dict[str, str]:
+        """Заголовки для запросов к реестру OWS.
+
+        Токен OWS отправляется ТОЛЬКО на хост реестра и перекрывает возможный
+        кабинетный ``Authorization`` клиента (это разные учётные данные).
+        """
+        token = self.settings.ows_token
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
+    @staticmethod
+    def ows_unauthorized(status: int) -> PortalError:
+        return PortalError(
+            f"Реестр OWS: HTTP {status}. {OWS_TOKEN_NOTICE}",
+            status=status,
+            code="OWS_UNAUTHORIZED",
+        )
 
     async def apply_manual_token(self, raw_credential: str) -> KeyInfo:
         """Установить учётные данные только для подтверждённого контракта."""
@@ -426,6 +444,13 @@ class SessionManager:
                 name="session-keepalive",
             )
         self._set_state(SessionState.PROBING)
+        if not self.settings.cabinet_api_verified:
+            # LIVE: пути кабинета не подтверждены — никаких запросов к ним.
+            self.log.info(
+                "LIVE: прогрев кабинета пропущен (API кабинета не подтверждён)"
+            )
+            self._set_state(SessionState.OFFLINE)
+            return
         if self.settings.session.prefetch_session_state_on_start:
             # Стартовый прогрев — только TCP/TLS и «живость» портала,
             # relogin здесь не делаем: явный authenticate идёт отдельно.
@@ -464,6 +489,8 @@ class SessionManager:
 
     async def warmup(self) -> bool:
         """Прогрев соединения: открывает TCP/TLS и проверяет живость сессии."""
+        if not self.settings.cabinet_api_verified:
+            return False
         try:
             await self.ping(timeout=min(self.settings.timeouts.read, 4.0))
             return True
@@ -781,6 +808,7 @@ class SessionManager:
                 and retry
                 and attempt < attempts
                 and relogins < policy.relogin_attempts
+                and self.settings.cabinet_api_verified
             ):
                 relogins += 1
                 self.log.warning(
@@ -827,8 +855,12 @@ class SessionManager:
             "POST",
             self.settings.endpoints.graphql_url(),
             json=payload,
+            headers=self.ows_headers(),
+            allow_relogin=False,
             timeout=timeout or self.settings.timeouts.lot_query,
         )
+        if response.status_code in (401, 403):
+            raise self.ows_unauthorized(response.status_code)
         if response.status_code >= 400:
             raise PortalError(
                 f"GraphQL HTTP {response.status_code}",
@@ -853,6 +885,8 @@ class SessionManager:
         self, timeout: float | None = None, allow_relogin: bool = True
     ) -> float:
         """Пинг сессии. Возвращает задержку в мс, бросает PortalError при сбое."""
+        if not self.settings.cabinet_api_verified:
+            raise PortalError(LIVE_AUTH_NOTICE, code="LIVE_AUTH_UNVERIFIED")
         started = time.perf_counter()
         response = await self.request(
             "GET",
@@ -899,6 +933,10 @@ class SessionManager:
                 return  # пришла команда остановки
             except TimeoutError:
                 pass
+
+            if not self.settings.cabinet_api_verified:
+                # LIVE без подтверждённого API кабинета: пинговать нечего.
+                continue
 
             if self.age_seconds >= session_cfg.max_age_seconds:
                 self.log.warning(

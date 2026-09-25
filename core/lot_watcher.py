@@ -369,10 +369,15 @@ class LotWatcher:
         return start.timestamp() if start else None
 
     # -- запрос состояния --------------------------------------------------- #
+    def _ows_headers(self) -> dict[str, str]:
+        """Заголовки реестра OWS (токен); сессия-заглушка без метода → пусто."""
+        getter = getattr(self.session, "ows_headers", None)
+        return dict(getter()) if callable(getter) else {}
+
     async def fetch(self, lot_id: int, *, conditional: bool = True) -> LotState | None:
         """Читает лот. ``None`` означает «данные не изменились» (HTTP 304)."""
         endpoint = self.settings.endpoints
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = self._ows_headers()
         if conditional and self.settings.watcher.conditional_requests and self._etag:
             headers["If-None-Match"] = self._etag
         payload = {
@@ -385,6 +390,7 @@ class LotWatcher:
             endpoint.graphql_url(),
             json=payload,
             headers=headers,
+            allow_relogin=False,
             timeout=self.settings.timeouts.lot_query,
         )
         received_at = time.time()
@@ -394,6 +400,9 @@ class LotWatcher:
         if response.status_code == 304:
             self.stats["not_modified"] += 1
             return None
+        if response.status_code in (401, 403):
+            self.stats["errors"] += 1
+            raise SessionManager.ows_unauthorized(response.status_code)
         if response.status_code >= 400:
             self.stats["errors"] += 1
             raise PortalError(
@@ -440,17 +449,30 @@ class LotWatcher:
         """
         count = samples or self.settings.watcher.clock_sync_samples
         endpoints = self.settings.endpoints
-        urls = [
-            endpoints.cabinet_url(endpoints.session_ping_path),
-            endpoints.cabinet_url(endpoints.auth_challenge_path),
-        ]
+        if self.settings.cabinet_api_verified:
+            targets = [
+                ("GET", endpoints.cabinet_url(endpoints.session_ping_path), None),
+                ("GET", endpoints.cabinet_url(endpoints.auth_challenge_path), None),
+            ]
+        else:
+            # LIVE: пути кабинета не подтверждены — меряем по реестру OWS.
+            # Заголовок Date есть и в ответе 401, токен для часов не обязателен.
+            targets = [
+                (
+                    "POST",
+                    endpoints.graphql_url(),
+                    {"query": "{ __typename }"},
+                )
+            ]
         for index in range(max(1, count)):
-            url = urls[index % len(urls)]
+            method, url, body = targets[index % len(targets)]
             try:
                 sent_at = time.time()
                 response = await self.session.request(
-                    "GET",
+                    method,
                     url,
+                    json=body,
+                    headers=self._ows_headers() if body is not None else None,
                     allow_relogin=False,
                     timeout=self.settings.timeouts.read,
                 )
@@ -673,9 +695,14 @@ class LotWatcher:
             self.stop()
 
     async def confirm_open(
-        self, lot_id: int, *, fallback: LotState, attempts: int = 8
+        self, lot_id: int, *, fallback: LotState, attempts: int = 10
     ) -> LotState:
         """Подтверждает открытие реальным статусом (частые короткие опросы).
+
+        Первый опрос — сразу, без паузы: таймер T0 уже сработал, и лишние
+        ``post_open_interval`` мс перед первой проверкой означали бы опоздание
+        подачи. Паузы между повторами растут 50 → 100 → 200 мс → потолок
+        ``post_open_interval``, чтобы не «долбить» портал.
 
         Если портал так и не отдал статус «приём заявок», открытие считается
         НЕПОДТВЕРЖДЁННЫМ и поднимается ``PortalError`` — подавать заявку
@@ -690,9 +717,11 @@ class LotWatcher:
                 return state
             if attempt % 4 == 0:
                 self.log.debug("Подтверждение открытия: попытка %d", attempt)
-            await asyncio.sleep(cfg.post_open_interval)
+            if attempt > 1:
+                delay = min(cfg.post_open_interval, 0.05 * (2 ** (attempt - 2)))
+                await asyncio.sleep(max(cfg.min_interval_hard / 3.0, delay))
             try:
-                fresh = await self.fetch(lot_id)
+                fresh = await self.fetch(lot_id, conditional=False)
             except PortalError:
                 continue
             if fresh is not None:

@@ -29,6 +29,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
 import re
 import secrets
 import time
@@ -425,9 +426,14 @@ class MockLot:
 
     # -- расписание --------------------------------------------------------- #
     def schedule(self, delay_s: float | None = None) -> None:
-        """Перепланирует T0: ``delay_s`` секунд от текущего момента."""
+        """Перепланирует T0: ``delay_s`` секунд от текущего момента.
+
+        start_epoch выравнивается вверх до целой секунды: реальный портал
+        отдаёт startDate посекундно (``_fmt``), а дробные миллисекунды здесь
+        означали бы «объявленный T0 наступил, а лот ещё закрыт» — до 1 с.
+        """
         delay = self.open_after_s if delay_s is None else delay_s
-        self.start_epoch = time.time() + float(delay)
+        self.start_epoch = float(math.ceil(time.time() + float(delay)))
         self.status_id = 210
         self.status_name = "Опубликован"
         self.status_code = "PUBLISHED"

@@ -260,3 +260,35 @@ def test_ui_stale_event_ignored(app):
     app._runs[123] = "new"
     app._handle_event("stage", {"lot_id": 123, "run_id": "old", "stage": "submit"})
     assert card._status_line.cget("text") == "current"
+
+
+def test_live_backend_refuses_real_arm_and_allows_dry_run(tmp_path):
+    pytest.importorskip("tkinter")
+    from ui.app import Backend
+    from ui.components import UiEventQueue
+
+    settings = load_settings(dry_run=False)
+    settings = replace(
+        settings,
+        license=replace(
+            settings.license,
+            license_path=tmp_path / "license.json",
+            trial_path=tmp_path / "trial.json",
+        ),
+    )
+    live_backend = Backend(settings, UiEventQueue())
+    with pytest.raises(ValueError, match="LIVE-подача заблокирована"):
+        live_backend.arm(123, "", BidRequest(123))
+    assert not live_backend.is_armed(123)
+    assert live_backend.arm(123, "", BidRequest(123, dry_run=True))
+
+
+def test_ows_token_update_propagates(backend):
+    async def scenario():
+        updated = await backend.set_ows_token("Bearer tok-1")
+        assert updated.ows_token == "tok-1"
+        assert backend.session.settings.ows_token == "tok-1"
+        assert backend.watcher.settings.ows_token == "tok-1"
+        assert (await backend.set_ows_token("")).ows_token == ""
+
+    asyncio.run(scenario())

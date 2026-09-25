@@ -38,7 +38,7 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 
 from config.niche_blueprints import SignMode
-from config.settings import NCALayerSettings
+from config.settings import LOOPBACK_HOSTS, NCALayerSettings
 from utils.logger import get_logger
 
 # __all__ объявлен в конце модуля (после определения всех имён).
@@ -426,6 +426,16 @@ class NCALayerClient:
             if url.startswith("wss://"):
                 import ssl as _ssl
 
+                # Самоподписанный сертификат допустим только для локального
+                # сервиса НУЦ РК. На любом другом хосте отключённая проверка
+                # TLS открыла бы MITM — такое подключение запрещено.
+                if self.settings.host not in LOOPBACK_HOSTS:
+                    raise NCALayerError(
+                        f"NCALayer должен работать на локальном адресе, а не на "
+                        f"«{self.settings.host}»: проверка TLS отключается только "
+                        "для 127.0.0.1/::1/localhost",
+                        code="NCA_NOT_LOOPBACK",
+                    )
                 ctx = _ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = _ssl.CERT_NONE

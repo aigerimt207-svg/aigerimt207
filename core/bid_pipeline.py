@@ -743,6 +743,19 @@ class BidPipeline:
         )
         return plan
 
+    # -- защита LIVE -------------------------------------------------------- #
+    def _live_guard(self, plan: BidPlan) -> None:
+        """Запрещает реальную подпись/загрузку/подачу без подтверждённого API.
+
+        Это последняя линия обороны в ЯДРЕ, независимая от UI: даже если
+        кто-то снимет DRY-RUN в интерфейсе или вызовет конвейер напрямую,
+        в LIVE без подтверждённого контракта кабинета ничего не подпишется и
+        не уйдёт на непроверенные адреса.
+        """
+        if plan.dry_run or self.settings.live_submit_allowed:
+            return
+        raise PortalError(LIVE_SUBMIT_NOTICE, code="LIVE_SUBMIT_UNVERIFIED")
+
     # -- шаг 2: взвод (подпись + предзагрузка) ------------------------------ #
     async def warmup(
         self, plan: BidPlan, password: SecretPassword | None = None
@@ -781,6 +794,7 @@ class BidPipeline:
             )
             return plan
 
+        self._live_guard(plan)
         if cfg.sign_before_t0 and plan.sign_items:
             self.log.info(
                 "Подпись %d документ(ов) одним вызовом NCALayer…",
@@ -952,6 +966,20 @@ class BidPipeline:
                 stages=stopwatch.report(),
                 total_ms=stopwatch.total_ms,
                 t0_delta_ms=self._t0_delta_ms(plan),
+            )
+
+        try:
+            self._live_guard(plan)
+        except PortalError as exc:
+            self.stats["failed"] += 1
+            self.log.error("%s", exc)
+            return BidResult(
+                ok=False,
+                lot_id=plan.lot.lot_id,
+                idem_key=plan.idem_key,
+                errors=[str(exc)],
+                stages=stopwatch.report(),
+                total_ms=stopwatch.total_ms,
             )
 
         try:
@@ -1271,6 +1299,14 @@ class BidPipeline:
                     + "; ".join(plan.errors),
                     idem_key=plan.idem_key,
                     dry_run=plan.dry_run,
+                )
+
+            # LIVE без подтверждённого API: стоп ДО подписи и наблюдения.
+            if not plan.dry_run and not self.settings.live_submit_allowed:
+                return failure(
+                    LIVE_SUBMIT_NOTICE,
+                    idem_key=plan.idem_key,
+                    dry_run=False,
                 )
 
             stage("warmup")

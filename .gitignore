@@ -18,3 +18,15 @@ htmlcov/
 # Temporary audit files
 /_audit_tests.log
 /_audit_probe.py
+
+# Secrets and user data: never commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+*.har
+license.json
+trial.json

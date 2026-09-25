@@ -29,8 +29,17 @@ from typing import Any, Final
 from urllib.parse import urlsplit
 
 APP_NAME: Final[str] = "FastBid GosZakup"
-APP_VERSION: Final[str] = "1.0.1"
+APP_VERSION: Final[str] = "1.1.0"
 PORTAL_LOGIN_URL: Final[str] = "https://v3bl.goszakup.gov.kz/ru/user/sso_redirect"
+# Единый список loopback-адресов: mock-контракт и доверие к самоподписанному
+# TLS NCALayer допускаются ТОЛЬКО для них.
+LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "::1", "localhost"})
+OWS_TOKEN_NOTICE: Final[str] = (
+    "Публичный реестр OWS v3 (ows.goszakup.gov.kz) отвечает HTTP 401 без токена. "
+    "Получите токен OWS в личном кабинете (раздел API / «Токен для OWS») и "
+    "задайте его в «Настройки» или через FASTBID_OWS_TOKEN. Токен хранится "
+    "только в памяти и отправляется только на хост реестра."
+)
 LIVE_AUTH_NOTICE: Final[str] = (
     "Вход в живой кабинет из FastBid пока недоступен: контракт SSO и проверка "
     "кабинетной сессии не подтверждены. Используйте официальный вход в браузере "
@@ -406,23 +415,39 @@ class AppSettings:
     dry_run: bool = False
     # Режим работы: live (реальный портал) | mock (локальные заглушки)
     mode: str = "live"
+    # Bearer-токен публичного реестра OWS v3 (только RAM/env, в файлы не пишется).
+    ows_token: str = _env("FASTBID_OWS_TOKEN", "")
 
     @property
     def uses_local_mock(self) -> bool:
         """Одного mode=mock недостаточно для разрешения тестового контракта."""
-        loopback = {"127.0.0.1", "::1", "localhost"}
-        if self.mode != "mock" or self.ncalayer.host not in loopback:
+        if self.mode != "mock" or self.ncalayer.host not in LOOPBACK_HOSTS:
             return False
         for base in (self.endpoints.base, self.endpoints.cabinet_base):
             url = urlsplit(base)
             if (
                 url.scheme != "http"
-                or url.hostname not in loopback
+                or url.hostname not in LOOPBACK_HOSTS
                 or url.username is not None
                 or url.password is not None
             ):
                 return False
         return True
+
+    @property
+    def cabinet_api_verified(self) -> bool:
+        """Подтверждён ли контракт API кабинета (вход, ping, загрузка, submit).
+
+        Сейчас подтверждён только локальный mock-контракт. Когда пути кабинета
+        будут сверены по HAR-записи реального трафика, условие меняется ЗДЕСЬ
+        (и только здесь) — остальной код опирается на это свойство.
+        """
+        return self.uses_local_mock
+
+    @property
+    def live_submit_allowed(self) -> bool:
+        """Разрешена ли реальная подпись/загрузка/подача (не DRY-RUN)."""
+        return self.cabinet_api_verified
 
     # -- производные пути -------------------------------------------------- #
     @property
@@ -468,6 +493,8 @@ class AppSettings:
             ncalayer=ncalayer,
             mode="mock",
             auth_mode="ecp",
+            # Настоящий токен реестра не должен уходить на заглушки.
+            ows_token="",
         )
 
     def describe(self) -> dict[str, Any]:
@@ -482,6 +509,9 @@ class AppSettings:
             "relogin_delay_s": self.retries.relogin_delay,
             "price_factor": self.pipeline.price_factor_default,
             "dry_run": self.dry_run,
+            "cabinet_api_verified": self.cabinet_api_verified,
+            "live_submit_allowed": self.live_submit_allowed,
+            "ows_token": "задан" if self.ows_token else "нет",
             "data_dir": str(DATA_DIR),
         }
 

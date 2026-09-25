@@ -35,6 +35,7 @@ from config.settings import (
     APP_VERSION,
     LIVE_AUTH_NOTICE,
     LIVE_SUBMIT_NOTICE,
+    OWS_TOKEN_NOTICE,
     PORTAL_LOGIN_URL,
     AppSettings,
 )
@@ -233,11 +234,26 @@ class Backend:
         with self._armed_lock:
             if self.armed:
                 raise ValueError("Снимите активные заявки перед изменением профиля")
-            updated = dataclasses.replace(self.settings, profile=profile)
-            self.settings = updated
-            self.session.settings = updated
-            self.pipeline.settings = updated
-            self.watcher.settings = updated
+            return self._apply_settings(
+                dataclasses.replace(self.settings, profile=profile)
+            )
+
+    def _apply_settings(self, updated: AppSettings) -> AppSettings:
+        """Раздаёт новые настройки всем компонентам бэкенда."""
+        self.settings = updated
+        self.session.settings = updated
+        self.pipeline.settings = updated
+        self.watcher.settings = updated
+        return updated
+
+    async def set_ows_token(self, raw: str) -> AppSettings:
+        """Токен реестра OWS v3 (только RAM). Пустая строка — сброс."""
+        with self._armed_lock:
+            if self.armed:
+                raise ValueError("Снимите активные заявки перед сменой токена OWS")
+            token, _cookie = SessionManager.parse_credential(raw)
+            updated = self._apply_settings(self.settings.with_(ows_token=token))
+        self.log.info("Токен OWS %s", "задан" if token else "сброшен")
         return updated
 
     async def unlock_and_login(self, password_value: str = "") -> dict[str, Any]:
@@ -269,6 +285,8 @@ class Backend:
                 raise ValueError(f"Лот {lot_id} уже взведён или ещё снимается")
             if lot_id <= 0 or request.lot_id != lot_id:
                 raise ValueError("Некорректный ID лота")
+            if not request.dry_run and not self.settings.live_submit_allowed:
+                raise ValueError(LIVE_SUBMIT_NOTICE)
             if (
                 self.settings.license.enforce
                 and not self.license.check(force=True).valid
@@ -596,6 +614,13 @@ class FastBidApp(ctk.CTk):
             fg_color=COLORS["dim"],
         )
         self._lock_button.pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            bar,
+            text="Открыть портал в браузере",
+            width=210,
+            command=self._on_open_portal,
+            fg_color=COLORS["dim"],
+        ).pack(side="left", padx=(8, 0))
         self._key_label = ctk.CTkLabel(
             tab,
             text="Вход не выполнен. Выберите способ авторизации.",
@@ -637,9 +662,11 @@ class FastBidApp(ctk.CTk):
             tab,
             text="MOCK: локальная проверка без реальных закупок"
             if self.settings.mode == "mock"
-            else "LIVE: API кабинета и формат заявки требуют проверки перед реальной подачей",
+            else f"LIVE: {LIVE_SUBMIT_NOTICE}",
             text_color=COLORS["dim"],
             font=ctk.CTkFont(size=11),
+            wraplength=1100,
+            justify="left",
         ).pack(anchor="w", padx=10, pady=4)
 
     # -- вкладка «Лоты» ------------------------------------------------------ #
@@ -897,12 +924,18 @@ class FastBidApp(ctk.CTk):
 
         toggles = ctk.CTkFrame(frame, fg_color="transparent")
         toggles.pack(fill="x", pady=(10, 0))
+        live_locked = not self.settings.live_submit_allowed
         self._dry_run_var = ctk.BooleanVar(
-            value=self.settings.dry_run or self.settings.mode == "live"
+            value=self.settings.dry_run or self.settings.mode == "live" or live_locked
         )
-        ctk.CTkCheckBox(
-            toggles, text="DRY-RUN (не отправлять заявку)", variable=self._dry_run_var
-        ).pack(side="left")
+        self._dry_run_check = ctk.CTkCheckBox(
+            toggles,
+            text="DRY-RUN (не отправлять заявку)"
+            + (" — принудительно: API кабинета не подтверждён" if live_locked else ""),
+            variable=self._dry_run_var,
+            state="disabled" if live_locked else "normal",
+        )
+        self._dry_run_check.pack(side="left")
         self._appearance_menu = ctk.CTkOptionMenu(
             toggles,
             width=140,
@@ -925,6 +958,33 @@ class FastBidApp(ctk.CTk):
             text_color=COLORS["dim"],
             justify="left",
         ).pack(anchor="w", pady=8)
+
+        ctk.CTkLabel(
+            frame,
+            text="Токен реестра OWS v3",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", pady=(10, 0))
+        ows_row = ctk.CTkFrame(frame, fg_color="transparent")
+        ows_row.pack(fill="x", pady=2)
+        self._ows_token_var = ctk.StringVar(value="")
+        ctk.CTkEntry(
+            ows_row,
+            textvariable=self._ows_token_var,
+            width=420,
+            show="•",
+            placeholder_text="Bearer-токен из кабинета (раздел API)",
+        ).pack(side="left")
+        ctk.CTkButton(
+            ows_row, text="Применить", width=120, command=self._on_apply_ows_token
+        ).pack(side="left", padx=(10, 0))
+        self._ows_token_label = ctk.CTkLabel(
+            frame,
+            text=self._ows_token_status(),
+            text_color=COLORS["dim"],
+            justify="left",
+            wraplength=900,
+        )
+        self._ows_token_label.pack(anchor="w", pady=(2, 0))
         ctk.CTkLabel(
             frame,
             text="Ключевые endpoint'ы (только чтение):",
@@ -975,6 +1035,38 @@ class FastBidApp(ctk.CTk):
         chosen = filedialog.askdirectory(title="Папка с документами поставщика")
         if chosen:
             self._doc_dir_label.configure(text=chosen)
+
+    # -- токен OWS и портал ------------------------------------------------- #
+    def _ows_token_status(self) -> str:
+        if self.settings.uses_local_mock:
+            return "MOCK: реестр — локальная заглушка, токен не нужен."
+        if self.settings.ows_token:
+            return "Токен OWS задан (хранится только в памяти)."
+        return f"Токен OWS не задан. {OWS_TOKEN_NOTICE}"
+
+    def _on_apply_ows_token(self) -> None:
+        value = self._ows_token_var.get().strip()
+        future = self.bridge.submit(self.backend.set_ows_token(value))
+
+        def applied() -> None:
+            try:
+                self.settings = future.result()
+            except Exception as exc:
+                messagebox.showwarning("Токен OWS", str(exc))
+                return
+            self._ows_token_var.set("")
+            self._ows_token_label.configure(text=self._ows_token_status())
+
+        future.add_done_callback(lambda _f: self._callbacks.put(applied))
+
+    def _on_open_portal(self) -> None:
+        """Официальный вход в кабинет — в обычном браузере пользователя."""
+        try:
+            webbrowser.open(PORTAL_LOGIN_URL, new=2)
+        except Exception as exc:  # pragma: no cover - зависит от ОС
+            messagebox.showwarning("FastBid", f"Не удалось открыть браузер: {exc}")
+            return
+        self.log.info("Открыт портал в браузере: %s", PORTAL_LOGIN_URL)
 
     def _on_save_profile(self) -> None:
         values = {key: var.get().strip() for key, var in self._profile_vars.items()}
@@ -1125,7 +1217,9 @@ class FastBidApp(ctk.CTk):
             documents=list(self._chosen_docs),
             lot_documents=list(self._chosen_lot_docs),
             document_slots=dict(self._doc_slots),
-            dry_run=bool(self._dry_run_var.get()) or self.settings.dry_run,
+            dry_run=bool(self._dry_run_var.get())
+            or self.settings.dry_run
+            or not self.settings.live_submit_allowed,
         )
         return request
 
@@ -1135,6 +1229,9 @@ class FastBidApp(ctk.CTk):
             messagebox.showwarning("Лот", "Сохраните параметры на вкладке «Лоты».")
             return
         blueprint_id = request.blueprint_id
+        if not request.dry_run and not self.settings.live_submit_allowed:
+            messagebox.showwarning("FastBid", LIVE_SUBMIT_NOTICE)
+            return
         if self.settings.mode == "live" and not request.dry_run:
             confirmed = messagebox.askyesno(
                 "Подтверждение подачи",
@@ -1203,6 +1300,15 @@ class FastBidApp(ctk.CTk):
             )
             return
         mode = self._auth_mode()
+        if not self.settings.cabinet_api_verified:
+            # LIVE: вход в кабинет из FastBid не подтверждён — объясняем и
+            # предлагаем официальный вход в браузере, ничего не отправляя.
+            if messagebox.askyesno(
+                "Вход недоступен",
+                f"{LIVE_AUTH_NOTICE}\n\nОткрыть портал в браузере?",
+            ):
+                self._on_open_portal()
+            return
         if mode == "token":
             dialog = CredentialDialog(self, "token")
             value = dialog.wait_value()
@@ -1281,10 +1387,9 @@ class FastBidApp(ctk.CTk):
                     or getattr(exc, "status", 0) == 404
                 ):
                     hint = (
-                        "\n\nПодсказка: кабинет ответил HTML-страницей "
-                        "вместо API — пути ЭЦП-входа к живому кабинету "
-                        "помечены VERIFY и ещё не подтверждены. "
-                        "Рабочий способ сейчас: «Токен из браузера»."
+                        "\n\nПодсказка: кабинет ответил не в формате API — пути "
+                        "входа к живому кабинету помечены VERIFY и не "
+                        "подтверждены. Войдите через «Открыть портал в браузере»."
                     )
                 messagebox.showerror("FastBid", f"Вход не удался:\n{exc}{hint}")
                 return

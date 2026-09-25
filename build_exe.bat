@@ -1,6 +1,6 @@
 @echo off
 rem Build the standalone FastBid.exe GUI application.
-rem Requirements: Python 3.12+, pip install -r requirements.txt pyinstaller tzdata
+rem Requirements: Python 3.13 (with Tcl/Tk), pip install -r requirements-dev.txt
 setlocal
 cd /d "%~dp0"
 py -3 -c "import tkinter"
