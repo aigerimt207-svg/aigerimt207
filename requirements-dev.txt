@@ -1,9 +1,7 @@
-# FastBid GosZakup — инструменты разработки и сборки
+# Разработка, проверки и сборка EXE (поверх runtime-зависимостей)
 # Установка: pip install -r requirements-dev.txt
 -r requirements.txt
 
-pytest>=8.0
-ruff>=0.16
-
-# Сборка дистрибутивов (опционально)
-pyinstaller>=6.10.0
+pytest>=8.0,<10
+ruff>=0.16,<0.17
+pyinstaller>=6.10,<7
