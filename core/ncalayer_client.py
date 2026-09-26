@@ -276,15 +276,21 @@ def sha256_hex(raw: bytes) -> str:
 # --------------------------------------------------------------------------- #
 # Разбор сертификата ЭЦП
 # --------------------------------------------------------------------------- #
-_BIN_IIN_RE = r"\b\d{12}\b"
+# 12 цифр БИН/ИИН; допускаем префикс IIN/BIN, приклеенный к номеру
+# (настоящие сертификаты НУЦ: SERIALNUMBER=IIN123456789012, OU=BIN…).
+_BIN_IIN_RE = r"(?<![0-9])(?:IIN|BIN)?([0-9]{12})(?![0-9])"
+_BIN_IIN_MARKED_RE = r"(?:IIN|BIN)\s*[:=]?\s*[0-9]{12}"
 
 
 def extract_bin_iin_from_certificate(cert: Any) -> str:
     """Достаёт БИН/ИИН (12 цифр) из сертификата ЭЦП РК.
 
-    Сертификаты НУЦ РК держат БИН/ИИН в атрибуте ``serialNumber`` (``SN``) либо
-    в пользовательских OID ветки 1.2.398.3.3.4. Перебираем значения subject,
-    SubjectAlternativeName и расширений — что найдётся первым, то и БИН/ИИН.
+    Сертификаты НУЦ РК держат БИН/ИИН в атрибуте ``serialNumber`` (``SN``) с
+    префиксом ``IIN``/``BIN`` (профиль сертификата npck.kz) либо в
+    пользовательских OID ветки 1.2.398.3.3.4. Перебираем значения subject,
+    SubjectAlternativeName и расширений. Приоритет: значения с явной меткой
+    IIN/BIN → OID ветки РК → общий перебор (защита от «случайных» 12 цифр
+    вроде телефона в CN).
     """
     import re
 
@@ -314,17 +320,29 @@ def extract_bin_iin_from_certificate(cert: Any) -> str:
     except Exception:  # pragma: no cover - защита от нестандартных сертификатов
         return ""
 
-    # Приоритет — значения OID ветки РК (там лежит БИН/ИИН ЮЛ)
+    def first_match(text: str) -> str:
+        match = re.search(_BIN_IIN_RE, text, re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    # 1) Явно помеченные значения (IIN…/BIN… — префикс или «метка=номер»).
+    for value in candidates:
+        text = str(value)
+        if re.search(_BIN_IIN_MARKED_RE, text, re.IGNORECASE):
+            found = first_match(text)
+            if found:
+                return found
+    # 2) OID ветки РК (там лежит БИН/ИИН ЮЛ).
     for value in candidates:
         text = str(value)
         if "1.2.398" in text and "=" in text:
-            match = re.search(_BIN_IIN_RE, text.split("=", 1)[-1])
-            if match:
-                return match.group(0)
+            found = first_match(text.split("=", 1)[-1])
+            if found:
+                return found
+    # 3) Общий перебор.
     for value in candidates:
-        match = re.search(_BIN_IIN_RE, str(value))
-        if match:
-            return match.group(0)
+        found = first_match(str(value))
+        if found:
+            return found
     return ""
 
 
@@ -361,6 +379,9 @@ class NCALayerClient:
         self._send_lock = asyncio.Lock()
         self._greeting: dict[str, Any] | None = None
         self._request_seq = 0
+        # Защита от рассинхрона «документ получил чужую подпись»: помним,
+        # какая подпись какому документу уже досталась (последние 256).
+        self._seen_signatures: dict[str, str] = {}
         self.stats: dict[str, int] = {
             "calls": 0,
             "batches": 0,
@@ -526,6 +547,14 @@ class NCALayerClient:
             try:
                 await self._ws.send(json.dumps(request, ensure_ascii=False))
                 raw = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
+            except asyncio.CancelledError:
+                # Отмена задачи (lock, disarm, закрытие окна) ОБЯЗАНА сбросить
+                # сокет: CancelledError — BaseException и общим except Exception
+                # не ловится, из-за чего запоздавший ответ доставался следующему
+                # запросу и документ получал чужую подпись.
+                self.stats["errors"] += 1
+                await self._reset()
+                raise
             except TimeoutError as exc:
                 self.stats["errors"] += 1
                 # Сокет обязательно сбрасываем: запоздавший ответ NCALayer иначе
@@ -540,7 +569,23 @@ class NCALayerClient:
                 self.stats["errors"] += 1
                 await self._reset()
                 raise NCALayerError(f"Соединение с NCALayer потеряно: {exc}") from exc
-            return self._parse_response(raw)
+            expected_id = request.get("id")
+            try:
+                response = self._parse_response(raw)
+                if (
+                    expected_id is not None
+                    and isinstance(response, dict)
+                    and response.get("id") not in (None, expected_id)
+                ):
+                    raise NCALayerError(
+                        "NCALayer ответил на другой запрос (id не совпал)",
+                        code="NCA_DESYNC",
+                    )
+            except Exception:
+                # Некорректный или чужой ответ тоже рассинхронизирует поток.
+                await self._reset()
+                raise
+            return response
 
     async def _reset(self) -> None:
         self.stats["reconnects"] += 1
@@ -548,6 +593,30 @@ class NCALayerClient:
             await self.close()
         except Exception:
             pass
+
+    def _check_signature_owner(self, key: str, signature_b64: str) -> None:
+        """Защита от рассинхрона: одна подпись не принадлежит двум документам.
+
+        При рассинхроне запрос/ответ документ B мог получить подпись документа
+        A. Такой случай фиксируется и поднимается — отправлять на портал
+        чужую подпись нельзя.
+        """
+        if not signature_b64:
+            return
+        previous = self._seen_signatures.get(signature_b64)
+        if previous is not None and previous != key:
+            self.stats["errors"] += 1
+            raise NCALayerError(
+                "Обнаружен рассинхрон подписи: документ получил чужую подпись",
+                code="NCA_SIGNATURE_DESYNC",
+                details=f"«{key}» унаследовал подпись «{previous}»",
+            )
+        if previous is None:
+            self._seen_signatures[signature_b64] = key
+            if len(self._seen_signatures) > 256:
+                # ограничиваем память: удаляем самые старые записи
+                for stale in list(self._seen_signatures)[:-128]:
+                    self._seen_signatures.pop(stale, None)
 
     def _parse_response(self, raw: str | bytes) -> Any:
         try:
@@ -707,6 +776,8 @@ class NCALayerClient:
             "basics",
         )
         signatures = self._extract_signatures(result, len(loaded))
+        for (item, _raw), signature in zip(loaded, signatures, strict=True):
+            self._check_signature_owner(item.key, signature)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         per_doc_ms = elapsed_ms / max(len(loaded), 1)
         documents: list[SignedDocument] = []
@@ -742,6 +813,7 @@ class NCALayerClient:
                 "basics",
             )
             signature = self._extract_signatures(result, 1)[0]
+            self._check_signature_owner(item.key, signature)
             self.stats["signatures"] += 1
             documents.append(
                 SignedDocument(

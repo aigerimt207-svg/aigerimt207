@@ -261,10 +261,16 @@ class LotState:
 
     # -- время -------------------------------------------------------------- #
     def start_dt(self, tz_name: str = "Asia/Almaty") -> datetime | None:
-        """Момент открытия приёма заявок (T0)."""
-        return parse_portal_datetime(
+        """Момент открытия приёма заявок (T0).
+
+        По схеме OWS v3 приём заявок открывается в ``startDate``.
+        ``repeatStartDate`` — срок начала ДОПОЛНЕНИЯ заявок (не открытие
+        окна): использование его как T0 приводило к пропуску окна подачи.
+        Fallback на ``repeatStartDate`` — только если ``startDate`` пуст.
+        """
+        return parse_portal_datetime(self.start_date, tz_name) or parse_portal_datetime(
             self.repeat_start_date, tz_name
-        ) or parse_portal_datetime(self.start_date, tz_name)
+        )
 
     def end_dt(self, tz_name: str = "Asia/Almaty") -> datetime | None:
         return parse_portal_datetime(
@@ -683,11 +689,13 @@ class LotWatcher:
                     on_tick(state)
                 t0_epoch = self._reschedule_if_t0_changed(state, t0_epoch)
 
-            final = await self.confirm_open(lot_id, fallback=state)
-            self.stats["open_confirmed"] = True
+            # T0 (или статус) достигнуты — выходим на подачу НЕМЕДЛЕННО.
+            # Подтверждение реальным статусом выполняет вызывающий код В ФОНЕ:
+            # запаздывание OWS раньше сдвигало submit на секунды после T0 или
+            # срывало подачу с OPEN_NOT_CONFIRMED.
             if on_open is not None:
-                on_open(final)
-            return final
+                on_open(state)
+            return state
         finally:
             # Открытие не подтверждено, отмена или ошибка — «висящих» таймеров
             # и привязки сессии к T0 остаться не должно.

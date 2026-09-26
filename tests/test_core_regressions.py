@@ -628,7 +628,15 @@ def test_arm_timer_reschedules_on_t0_change_and_stop_cleans(settings) -> None:
     assert state["t0_values"]
 
 
-def test_confirm_open_unconfirmed_raises(settings) -> None:
+def test_watch_returns_at_t0_without_status_confirmation(settings) -> None:
+    """Подача не должна зависеть от подтверждения статуса OWS.
+
+    Раньше watch() ждал confirm_open и срывался с OPEN_NOT_CONFIRMED, если
+    реестр запаздывал, — подача уходила на секунды позже T0 или не уходила
+    вовсе. Теперь watch() возвращается по таймеру T0, а подтверждение —
+    фоновая забота вызывающего кода.
+    """
+
     async def scenario() -> dict:
         servers = MockServers(open_after_s=1.0, nca_password=PASSWORD)
         await servers.start()
@@ -650,12 +658,24 @@ def test_confirm_open_unconfirmed_raises(settings) -> None:
             await session.authenticate()
             watcher = LotWatcher(session, mock_settings)
             error: PortalError | None = None
+            state = None
             try:
-                await watcher.watch(servers.portal.lot.id)
+                state = await watcher.watch(servers.portal.lot.id)
             except PortalError as exc:
                 error = exc
+            # подтверждение отдельным вызовом по-прежнему сигнализирует об ошибке
+            confirm_error: PortalError | None = None
+            if state is not None:
+                try:
+                    await watcher.confirm_open(
+                        servers.portal.lot.id, fallback=state, attempts=1
+                    )
+                except PortalError as exc:
+                    confirm_error = exc
             report = {
                 "error": error,
+                "state": state,
+                "confirm_error": confirm_error,
                 "open_confirmed": watcher.stats["open_confirmed"],
                 "timer": watcher._timer_task,
             }
@@ -666,8 +686,10 @@ def test_confirm_open_unconfirmed_raises(settings) -> None:
             await servers.stop()
 
     report = run(scenario())
-    assert report["error"] is not None
-    assert report["error"].code == "OPEN_NOT_CONFIRMED"
+    assert report["error"] is None  # watch вернулся по T0 без блокировки
+    assert report["state"] is not None
+    assert report["confirm_error"] is not None
+    assert report["confirm_error"].code == "OPEN_NOT_CONFIRMED"
     assert report["open_confirmed"] is False
     assert report["timer"] is None
 

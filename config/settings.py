@@ -166,6 +166,10 @@ class RetryPolicy:
     retry_statuses: tuple[int, ...] = (408, 425, 429, 500, 502, 503, 504)
     relogin_attempts: int = 2
     relogin_delay: float = 1.5
+    # Submit уходит строго по часам сервера (T0), но окно у портала может
+    # открыться с миллисекундным джиттером → первый POST ловит 425. Повторяем
+    # безопасно: тот же idem-ключ, перед каждым повтором — verify по ключу.
+    submit_425_window_s: float = 2.0
     # Перед повторным submit обязательно спрашиваем статус по idempotency-key:
     # двойная подача заявки недопустима.
     submit_verify_before_retry: bool = True

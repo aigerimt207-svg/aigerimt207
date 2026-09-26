@@ -1059,6 +1059,41 @@ class BidPipeline:
                 verified.total_ms = stopwatch.total_ms
                 return self._note_submitted(plan, verified, stopwatch)
 
+        # 425 — окно приёма ещё не открылось: submit уходит строго по часам
+        # сервера, а портал может открыть окно с миллисекундным джиттером.
+        # Повторяем безопасно в течение submit_425_window_s: тот же idem-ключ,
+        # перед каждым повтором — verify по ключу (двойной подачи не будет).
+        if response.status_code == 425:
+            deadline = time.monotonic() + self.settings.retries.submit_425_window_s
+            attempt_sleep = 0.1
+            while time.monotonic() < deadline:
+                await asyncio.sleep(attempt_sleep)
+                attempt_sleep = min(attempt_sleep * 2, 0.4)
+                verified = await self.verify(plan)
+                if verified.ok:
+                    verified.stages = stopwatch.report()
+                    verified.total_ms = stopwatch.total_ms
+                    return self._note_submitted(plan, verified, stopwatch)
+                response = await self.session.request(
+                    "POST",
+                    url,
+                    json=body,
+                    timeout=self.settings.timeouts.submit,
+                    retry=False,
+                    allow_relogin=False,
+                    follow_redirects=False,
+                )
+                payload = self._safe_json(response)
+                if 200 <= response.status_code < 300:
+                    problem = response_problem(payload)
+                    if problem is None:
+                        result = self._success_result(plan, payload, stopwatch)
+                        return await self._post_submit_verify(plan, result)
+                    break  # 2xx без подтверждения — наружу как есть
+                if response.status_code != 425:
+                    break  # другой статус — наружу как есть
+                self.log.debug("Повтор submit: окно ещё не открыто (HTTP 425)")
+
         self.stats["failed"] += 1
         detail = payload.get("message", "") if isinstance(payload, dict) else ""
         message = f"Подача отклонена: HTTP {response.status_code} {detail}".strip()
@@ -1277,6 +1312,7 @@ class BidPipeline:
 
         warm_task: asyncio.Task[Any] | None = None
         watch_task: asyncio.Task[Any] | None = None
+        confirm_task: asyncio.Task[Any] | None = None
         try:
             stage("clock")
             await self.watcher.sync_clock()
@@ -1337,13 +1373,35 @@ class BidPipeline:
             plan.lot = open_state
             overall.mark("wait")
 
+            # Подтверждение открытия статусом лота — В ФОНЕ: медленный OWS
+            # раньше сдвигал submit на секунды после T0 или срывал подачу
+            # с OPEN_NOT_CONFIRMED. Теперь submit уходит по часам сервера,
+            # а результат подтверждения — в журнал и статистику.
+            def _confirm_done(task: asyncio.Task[Any]) -> None:
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    self.log.warning("Открытие не подтверждено статусом OWS: %s", exc)
+                    return
+                self.stats["open_confirmed"] = True
+                self.log.success("Открытие подтверждено статусом лота")
+
+            try:
+                confirm_task = asyncio.create_task(
+                    self.watcher.confirm_open(request.lot_id, fallback=open_state)
+                )
+                confirm_task.add_done_callback(_confirm_done)
+            except RuntimeError as exc:  # нет работающего loop — не критично
+                self.log.debug("Подтверждение открытия не запущено: %s", exc)
+
             stage("submit")
             result = await self.submit(plan)
             overall.mark("submit")
         finally:
             # Любая ошибка/отмена: снимаем фоновые задачи и таймер T0, чтобы не
             # осталось «висящих» подписей, загрузок и наблюдения за лотом.
-            await self._cleanup_tasks(warm_task, watch_task)
+            await self._cleanup_tasks(warm_task, watch_task, confirm_task)
             self.watcher.stop()
 
         stages = dict(result.stages)
