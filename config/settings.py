@@ -57,17 +57,33 @@ T0_SOURCE_FIELD: Final[str] = "TrdBuy.startDate"
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+_ENV_WARNINGS: list[str] = []
+
+
 def _env(name: str, default: Any) -> Any:
-    """Читает значение из окружения с приведением к типу default."""
+    """Читает значение из окружения с приведением к типу default.
+
+    Некорректное числовое значение (например, ``FASTBID_NCA_PORT=abc``) не
+    роняет запуск (даже ``--help``) — берётся значение по умолчанию, а
+    предупреждение попадает в ``ENV_WARNINGS``.
+    """
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
     if isinstance(default, bool):
         return raw.strip().lower() in {"1", "true", "yes", "on", "да"}
     if isinstance(default, int):
-        return int(raw)
+        try:
+            return int(raw)
+        except ValueError:
+            _ENV_WARNINGS.append(f"{name}={raw!r} не число — использовано {default!r}")
+            return default
     if isinstance(default, float):
-        return float(raw)
+        try:
+            return float(raw)
+        except ValueError:
+            _ENV_WARNINGS.append(f"{name}={raw!r} не число — использовано {default!r}")
+            return default
     if isinstance(default, tuple):
         return tuple(part.strip() for part in raw.split(",") if part.strip())
     return raw
@@ -336,15 +352,18 @@ class LicenseSettings:
     """Привязка лицензии к БИН/ИИН из ЭЦП + отпечатку железа (HWID).
 
     Лицензия — Ed25519-подписанный JSON. Приватный ключ вендора в поставку НЕ
-    попадает: в приложении хранится только ПУБЛИЧНЫЙ ключ. Ключ можно заменить
-    при сборке через env ``FASTBID_LICENSE_PUBKEY`` или вставив PEM в
-    ``license_public_key.pem`` рядом с исполняемым файлом.
+    попадает: в приложении только ПУБЛИЧНЫЙ ключ, вшитый в
+    ``core/vendor_key.py``. Env-подмены (``FASTBID_LICENSE_PUBKEY``) и файл
+    ключа рядом с данными убраны: репозиторий публичный, и без вшитого ключа
+    любой мог выпустить себе лицензию. Смена ключа вендора = правка
+    ``core/vendor_key.py`` + пересборка.
     """
 
     license_path: Path = DATA_DIR / "license.json"
     trial_path: Path = DATA_DIR / "trial.json"
-    public_key_pem: str = _env("FASTBID_LICENSE_PUBKEY", "")
-    public_key_file: Path = DATA_DIR / "license_public_key.pem"
+    # Переопределяется ТОЛЬКО программно (dataclasses.replace) в тестах:
+    # env-переменной для подмены ключа больше нет.
+    public_key_pem: str = ""
     trial_days: int = 14
     offline_grace_days: int = 7
     require_hwid_match: bool = True
@@ -352,6 +371,7 @@ class LicenseSettings:
     # Блокировать работу (взвод заявок) при недействительной лицензии.
     # По умолчанию False: приложение запускается, показывает статус и
     # позволяет изучать интерфейс, но предупреждает о проблеме с лицензией.
+    # Для продажи выставляйте FASTBID_LICENSE_ENFORCE=1 при сборке.
     enforce: bool = _env("FASTBID_LICENSE_ENFORCE", False)
 
 

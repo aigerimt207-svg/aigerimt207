@@ -35,7 +35,7 @@ except Exception:
     pass
 
 from config.settings import APP_NAME, APP_VERSION, AppSettings, load_settings
-from core.license_guard import LicenseGuard, generate_keypair
+from core.license_guard import generate_keypair
 from ui.app import AsyncBridge, Backend, FastBidApp
 from ui.components import UiEventQueue
 from utils.logger import BUS, get_logger, setup_logging
@@ -302,7 +302,7 @@ def run_utilities(settings: AppSettings, args: Any) -> int | None:
         private_pem, public_pem = generate_keypair()
         print("=== PRIVATE (хранить у вендора, НЕ вкладывать в поставку) ===")
         print(private_pem)
-        print("=== PUBLIC (в FASTBID_LICENSE_PUBKEY или license_public_key.pem) ===")
+        print("=== PUBLIC (вшить в core/vendor_key.py и пересобрать) ===")
         print(public_pem)
         return 0
     if args.issue_license:
@@ -312,11 +312,23 @@ def run_utilities(settings: AppSettings, args: Any) -> int | None:
                 "--target-hwid <HWID> [--licensee ... --days N --to файл]"
             )
             return 2
+        from core.license_guard import LicenseGuard
+
+        normalized_hwid = LicenseGuard.normalize_hwid(args.target_hwid)
+        if len(normalized_hwid) != 32 or any(
+            ch not in "0123456789ABCDEF" for ch in normalized_hwid
+        ):
+            print(
+                "HWID должен быть 32 hex-символа. Возьмите его из вывода "
+                "--hwid или кнопки «Копировать HWID» (формат с дефисами "
+                "допустим — нормализуем автоматически)."
+            )
+            return 2
         private_pem = Path(args.private_key).read_text(encoding="utf-8")
         document = LicenseGuard.issue(
             args.licensee or "Лицензиат",
             args.bin,
-            args.target_hwid,
+            normalized_hwid,
             args.days,
             private_pem,
         )
