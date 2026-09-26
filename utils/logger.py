@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import queue
+import re
 import threading
 import time
 from collections import deque
@@ -81,6 +82,30 @@ class MSFormatter(logging.Formatter):
         # Локальное время — осознанно: журнал читают операторы на месте.
         local = datetime.fromtimestamp(record.created).astimezone()
         return f"{local:%H:%M:%S}"
+
+
+# Маскирование секретов в журнале: Bearer-токены не должны попадать в файлы
+# и UI-консоль даже при аварийном выводе ответов/исключений целиком.
+_BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]{8,}", re.IGNORECASE)
+
+
+def redact_secrets(text: str) -> str:
+    """Маскирует Bearer-токены в произвольном тексте журнала."""
+    return _BEARER_RE.sub(r"\1***", text)
+
+
+class SecretsFilter(logging.Filter):
+    """Вычищает Bearer-токены из сообщений до попадания в обработчики."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+            redacted = redact_secrets(message)
+            if redacted != message:
+                record.msg, record.args = redacted, None
+        except Exception:  # pragma: no cover - фильтр не должен ломать лог
+            pass
+        return True
 
 
 class RingLogStore(logging.Handler):
@@ -169,20 +194,24 @@ def setup_logging(
             handler.close()
 
     formatter = MSFormatter()
+    secrets_filter = SecretsFilter()
 
     store = RingLogStore(capacity=buffer_capacity, level=logging.NOTSET)
     store._fastbid = True  # type: ignore[attr-defined]
     store.setFormatter(formatter)
+    store.addFilter(secrets_filter)
     root.addHandler(store)
 
     sink = ui_sink or UILogSink()
     sink._fastbid = True  # type: ignore[attr-defined]
+    sink.addFilter(secrets_filter)
     root.addHandler(sink)
 
     if console:
         console_handler = logging.StreamHandler()
         console_handler._fastbid = True  # type: ignore[attr-defined]
         console_handler.setFormatter(formatter)
+        console_handler.addFilter(secrets_filter)
         root.addHandler(console_handler)
 
     if log_path is not None:

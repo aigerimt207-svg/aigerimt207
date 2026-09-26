@@ -5,7 +5,7 @@
 # документов и минимальная задержка submit.
 httpx[http2]>=0.28.1,<0.29
 websockets>=15.0,<16
-cryptography>=44.0,<47
+cryptography>=50.0.1,<51
 customtkinter>=5.2.2,<7
 darkdetect>=0.8.0
 tzdata>=2024.1; sys_platform == "win32"

@@ -36,10 +36,11 @@ except Exception:
 
 from config.settings import APP_NAME, APP_VERSION, AppSettings, load_settings
 from core.license_guard import generate_keypair
-from ui.app import AsyncBridge, Backend, FastBidApp
-from ui.components import UiEventQueue
 from utils.logger import BUS, get_logger, setup_logging
 from utils.mock_server import MockLot, MockServers
+
+# ui.app тянет tkinter: импортируем лениво в run_gui(), чтобы утилиты
+# --hwid/--gen-keys/--issue-license/--selftest работали и без Tk.
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -169,6 +170,10 @@ def run_gui(settings: AppSettings, args: Any) -> int:
             return 1
         settings = server_thread.servers.settings_for(settings)
         log.warning("MOCK-РЕЖИМ: %s", server_thread.servers.summary())
+
+    # Ленивый импорт: ui.app тянет tkinter (см. комментарий у импортов).
+    from ui.app import AsyncBridge, Backend, FastBidApp
+    from ui.components import UiEventQueue
 
     bridge = AsyncBridge()
     bridge.start()

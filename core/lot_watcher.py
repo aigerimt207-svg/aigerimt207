@@ -164,7 +164,9 @@ class ClockSync:
         self.samples += 1
         self.best_rtt_ms = min(self.best_rtt_ms, rtt_ms)
         self.last_sync_at = time.time()
-        if offset > self.offset_s or self.samples == 1:
+        # Классический NTP-приём: смещение берётся из замера с МИНИМАЛЬНЫМ
+        # RTT (повтор/потеря пакета завышают смещение — раньше брался max).
+        if self.samples == 1 or rtt_ms <= self.best_rtt_ms:
             self.offset_s = offset
             return True
         return False
@@ -287,14 +289,20 @@ class LotState:
         open_names: tuple[str, ...] = (),
         closed_names: tuple[str, ...] = (),
     ) -> bool:
-        """Открыт ли приём заявок по данным статуса лота."""
-        code = self.status_code.upper()
-        name = self.status_name.lower()
+        """Открыт ли приём заявок по данным статуса лота.
+
+        Сравнение ТОЧНОЕ: подстрока ловила ложные срабатывания —
+        «NOT_ACCEPTING» содержит «ACCEPTING», а «Прием заявок окончен» —
+        «прием заявок». closed_names остаются подстрокой (закрытое состояние
+        приоритетно и формулируется устойчиво).
+        """
+        code = self.status_code.strip().upper()
+        name = self.status_name.strip().lower()
         if any(item in name for item in closed_names):
             return False
-        if code and any(item in code for item in open_codes):
+        if code and any(item.upper() == code for item in open_codes):
             return True
-        return any(item in name for item in open_names)
+        return any(item == name for item in open_names)
 
     def describe(self) -> str:
         return (
@@ -727,7 +735,9 @@ class LotWatcher:
                 self.log.debug("Подтверждение открытия: попытка %d", attempt)
             if attempt > 1:
                 delay = min(cfg.post_open_interval, 0.05 * (2 ** (attempt - 2)))
-                await asyncio.sleep(max(cfg.min_interval_hard / 3.0, delay))
+                # Пол опроса — min_interval_hard, единый для всего поллера
+                # (нарушение пола в 150 мс = лишняя нагрузка на реестр).
+                await asyncio.sleep(max(cfg.min_interval_hard, delay))
             try:
                 fresh = await self.fetch(lot_id, conditional=False)
             except PortalError:

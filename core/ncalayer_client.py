@@ -444,19 +444,23 @@ class NCALayerClient:
                 "max_size": None,
                 "close_timeout": 2,
             }
+            # NCALayer — локальный сервис; ЛЮБОЕ подключение к нелокальному
+            # хосту запрещено (ws без TLS на чужом хосте = MITM читает всё,
+            # включая подписываемые документы и пароль).
+            if self.settings.host not in LOOPBACK_HOSTS:
+                raise NCALayerError(
+                    f"NCALayer должен работать на локальном адресе, а не на "
+                    f"«{self.settings.host}»: подключение к удалённому хосту "
+                    "запрещено (127.0.0.1/::1/localhost — единственные "
+                    "допустимые)",
+                    code="NCA_NOT_LOOPBACK",
+                )
             if url.startswith("wss://"):
                 import ssl as _ssl
 
                 # Самоподписанный сертификат допустим только для локального
                 # сервиса НУЦ РК. На любом другом хосте отключённая проверка
                 # TLS открыла бы MITM — такое подключение запрещено.
-                if self.settings.host not in LOOPBACK_HOSTS:
-                    raise NCALayerError(
-                        f"NCALayer должен работать на локальном адресе, а не на "
-                        f"«{self.settings.host}»: проверка TLS отключается только "
-                        "для 127.0.0.1/::1/localhost",
-                        code="NCA_NOT_LOOPBACK",
-                    )
                 ctx = _ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = _ssl.CERT_NONE

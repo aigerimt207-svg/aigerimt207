@@ -1052,6 +1052,8 @@ class FastBidApp(ctk.CTk):
             try:
                 self.settings = future.result()
             except Exception as exc:
+                # Не оставляем токен в поле и после ошибки применения.
+                self._ows_token_var.set("")
                 messagebox.showwarning("Токен OWS", str(exc))
                 return
             self._ows_token_var.set("")
@@ -1431,28 +1433,33 @@ class FastBidApp(ctk.CTk):
         """Все callbacks и Tk-вызовы исполняются только в UI-потоке."""
         if self._closing:
             return
-        for _ in range(100):
-            try:
-                callback = self._callbacks.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                callback()
-            except Exception:
-                self.log.exception("Ошибка обновления интерфейса")
-        elapsed = time.monotonic() - self._snapshot_at
-        for lot_id, card in self._cards.items():
-            left = self._left.get(lot_id)
-            if left is not None and self.backend.is_armed(lot_id):
-                card.countdown.set(left - elapsed)
-        for record in self.sink.drain():
-            self._log_console.append_record(record.format(), record.level)
-        for event, payload in self.events.drain():
-            try:
-                self._handle_event(event, payload)
-            except Exception:  # pragma: no cover - UI не должен падать
-                self.log.exception("Ошибка обработки события %s", event)
-        self.after(self.settings.ui.refresh_ms, self._tick)
+        try:
+            for _ in range(100):
+                try:
+                    callback = self._callbacks.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    callback()
+                except Exception:
+                    self.log.exception("Ошибка обновления интерфейса")
+            elapsed = time.monotonic() - self._snapshot_at
+            for lot_id, card in self._cards.items():
+                left = self._left.get(lot_id)
+                if left is not None and self.backend.is_armed(lot_id):
+                    card.countdown.set(left - elapsed)
+            for record in self.sink.drain():
+                self._log_console.append_record(record.format(), record.level)
+            for event, payload in self.events.drain():
+                try:
+                    self._handle_event(event, payload)
+                except Exception:  # pragma: no cover - UI не должен падать
+                    self.log.exception("Ошибка обработки события %s", event)
+        finally:
+            # Перепланирование в finally: одно исключение в обработчике не
+            # должно навсегда останавливать обновление интерфейса.
+            if not self._closing:
+                self.after(self.settings.ui.refresh_ms, self._tick)
 
     def _tick_snapshot(self) -> None:
         """Периодический снимок состояния бэкенда (раз в 1 с)."""

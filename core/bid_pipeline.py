@@ -58,6 +58,8 @@ __all__ = ["STAGES", "BidPipeline", "BidPlan", "BidRequest", "BidResult"]
 STAGES = ("clock", "plan", "sign", "upload", "wait", "submit", "verify")
 
 # Статусы, которыми портал ПОДТВЕРЖДАЕТ приём заявки, и статусы отказа.
+# «pending»/«processing» сознательно НЕ в списке: это не подтверждение подачи
+# (ложная «ЗАЯВКА ПОДАНА»), финальный статус проверяется verify по ключу.
 ACCEPTED_STATUSES = frozenset(
     {
         "accepted",
@@ -66,8 +68,6 @@ ACCEPTED_STATUSES = frozenset(
         "created",
         "registered",
         "submitted",
-        "processing",
-        "pending",
         "принята",
         "подана",
         "зарегистрирована",
@@ -856,6 +856,9 @@ class BidPipeline:
                     url,
                     json=body,
                     timeout=self.settings.timeouts.attachment_upload,
+                    # Загрузка БЕЗ повторов: ретрай мог задвоить вложение,
+                    # если первая попытка реально дошла до портала.
+                    retry=False,
                 )
                 if response.status_code >= 400:
                     raise PortalError(
